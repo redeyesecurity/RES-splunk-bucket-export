@@ -1,0 +1,53 @@
+# RES-splunk-bucket-export configuration
+# Copy to local/config.yaml and customize
+
+splunk_home: "/opt/splunk"
+
+# State tracking — records which buckets have been exported
+state_file: "/opt/splunk/etc/apps/bucket_export/local/export_state.json"
+
+# Batch size for writer flushes
+batch_size: 500
+
+# OCSF transformation
+ocsf:
+  enabled: true
+
+# Bucket discovery filters (optional)
+# indexes:
+#   - main
+#   - security
+# bucket_types:
+#   - warm
+#   - cold
+
+# Export destinations — enable the ones you need
+writers:
+  parquet:
+    enabled: true
+    path: "/data/splunk-export/parquet"
+    partition_by: "hour"
+    compression: "snappy"
+    row_group_size: 10000
+
+  s3:
+    enabled: false
+    bucket: "my-datalake-bucket"
+    prefix: "splunk-export/"
+    region: "us-east-1"
+    format: "parquet"
+    compression: "snappy"
+    partition_by: "hour"
+    # endpoint_url: "https://s3.us-east-1.amazonaws.com"
+    # access_key: ""
+    # secret_key: ""
+
+  json:
+    enabled: false
+    path: "/data/splunk-export/json"
+    compress: false
+    batch_size: 1000
+    partition_by: "hour"
+
+logging:
+  level: "INFO"
