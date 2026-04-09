@@ -1,6 +1,9 @@
-# RES-splunk-bucket-export configuration
+# ============================================================================
+# RES-splunk-bucket-export — Full configuration reference
 # Copy to local/config.yaml and customize
+# ============================================================================
 
+# Splunk installation path (indexer or HF)
 splunk_home: "/opt/splunk"
 
 # State tracking — records which buckets have been exported
@@ -13,7 +16,7 @@ batch_size: 500
 ocsf:
   enabled: true
 
-# Bucket discovery filters (optional)
+# Bucket discovery filters (optional — omit to export all)
 # indexes:
 #   - main
 #   - security
@@ -21,33 +24,189 @@ ocsf:
 #   - warm
 #   - cold
 
-# Export destinations — enable the ones you need
+# ============================================================================
+# WRITERS — All 11 destinations. Enable the ones you need.
+# Multiple writers can run simultaneously.
+# ============================================================================
 writers:
+
+  # --------------------------------------------------------------------------
+  # 1. LOCAL PARQUET — Hive-partitioned Parquet on local filesystem
+  # Requires: pyarrow
+  # --------------------------------------------------------------------------
   parquet:
     enabled: true
     path: "/data/splunk-export/parquet"
-    partition_by: "hour"
-    compression: "snappy"
+    partition_by: "hour"        # hour | day
+    compression: "snappy"       # snappy | gzip | zstd
     row_group_size: 10000
 
+  # --------------------------------------------------------------------------
+  # 2. S3 — AWS S3 / MinIO / Cloudflare R2
+  # Requires: boto3 (+ pyarrow for Parquet format)
+  # --------------------------------------------------------------------------
   s3:
     enabled: false
-    bucket: "my-datalake-bucket"
-    prefix: "splunk-export/"
+    bucket: "bronze"
+    prefix: "splunk-export/ocsf"
     region: "us-east-1"
-    format: "parquet"
+    format: "parquet"           # parquet | json
     compression: "snappy"
     partition_by: "hour"
-    # endpoint_url: "https://s3.us-east-1.amazonaws.com"
-    # access_key: ""
-    # secret_key: ""
+    row_group_size: 10000
+    # For MinIO / R2 / non-AWS — set endpoint_url
+    endpoint_url: ""            # e.g. http://192.168.1.61:9000
+    access_key: ""              # blank = use IAM role / env vars
+    secret_key: ""
 
-  json:
+  # --------------------------------------------------------------------------
+  # 3. LOCAL JSON — Newline-delimited JSON (no extra deps)
+  # --------------------------------------------------------------------------
+  local-json:
     enabled: false
     path: "/data/splunk-export/json"
     compress: false
     batch_size: 1000
     partition_by: "hour"
 
+  # --------------------------------------------------------------------------
+  # 4. KAFKA — Kafka / Confluent / Redpanda
+  # Requires: confluent-kafka
+  # --------------------------------------------------------------------------
+  kafka:
+    enabled: false
+    brokers:
+      - "kafka1:9092"
+      - "kafka2:9092"
+    topic: "security-events"
+    compression: "snappy"       # none | gzip | snappy | lz4 | zstd
+    acks: "all"                 # 0 | 1 | all
+    batch_size: 16384
+    linger_ms: 5
+    sasl:
+      enabled: false
+      mechanism: "PLAIN"        # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
+      username: ""
+      password: ""
+    tls:
+      enabled: false
+      ca: ""
+      cert: ""
+      key: ""
+
+  # --------------------------------------------------------------------------
+  # 5. LOKI — Grafana Loki push API
+  # Requires: requests
+  # --------------------------------------------------------------------------
+  loki:
+    enabled: false
+    url: "http://localhost:3100/loki/api/v1/push"
+    labels:
+      job: "bucket-export"
+      env: "production"
+    batch_size: 100
+    auth:
+      type: "none"              # none | basic | bearer
+      username: ""
+      password: ""
+      token: ""
+    tls:
+      enabled: false
+      ca: ""
+      verify: true
+
+  # --------------------------------------------------------------------------
+  # 6. ELASTICSEARCH / OPENSEARCH — Bulk index API
+  # Requires: elasticsearch
+  # --------------------------------------------------------------------------
+  elasticsearch:
+    enabled: false
+    hosts:
+      - "https://es1:9200"
+    index: "security-events"
+    index_date_pattern: "%Y.%m.%d"  # → security-events-2026.04.09
+    batch_size: 500
+    auth:
+      type: "none"              # none | basic | api_key
+      username: ""
+      password: ""
+      api_key: ""
+    tls:
+      enabled: true
+      ca: ""
+      verify: true
+
+  # --------------------------------------------------------------------------
+  # 7. WEBHOOK — Generic HTTP POST
+  # Requires: requests
+  # --------------------------------------------------------------------------
+  webhook:
+    enabled: false
+    url: "https://your-endpoint.com/events"
+    method: "POST"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer your-token"
+    format: "json"              # json | ndjson
+    batch: true                 # true = array, false = one req per event
+    batch_size: 100
+    retry:
+      enabled: true
+      max_attempts: 3
+      backoff_ms: 1000
+
+  # --------------------------------------------------------------------------
+  # 8. SYSLOG — RFC 5424 (TCP / UDP / TLS)
+  # No extra deps required
+  # --------------------------------------------------------------------------
+  syslog:
+    enabled: false
+    host: "syslog.corp"
+    port: 514
+    protocol: "tcp"             # tcp | udp | tls
+    facility: 16                # local0
+    tls:
+      enabled: false
+      ca: ""
+      verify: true
+
+  # --------------------------------------------------------------------------
+  # 9. AZURE EVENT HUBS
+  # Requires: azure-eventhub
+  # --------------------------------------------------------------------------
+  azure-eventhubs:
+    enabled: false
+    connection_string: ""       # Endpoint=sb://...
+    eventhub_name: ""
+    batch_size: 100
+
+  # --------------------------------------------------------------------------
+  # 10. GCP PUB/SUB
+  # Requires: google-cloud-pubsub
+  # --------------------------------------------------------------------------
+  gcp-pubsub:
+    enabled: false
+    project_id: ""
+    topic: ""
+    credentials_file: ""        # path to service account JSON (or use GOOGLE_APPLICATION_CREDENTIALS)
+    batch_size: 100
+
+  # --------------------------------------------------------------------------
+  # 11. SPLUNK HEC — HTTP Event Collector
+  # Requires: requests
+  # --------------------------------------------------------------------------
+  splunk-hec:
+    enabled: false
+    url: "https://splunk:8088"
+    token: ""
+    index: "main"
+    sourcetype: "bucket_export:ocsf"
+    batch_size: 100
+    tls:
+      verify: true
+
+# ============================================================================
+# Logging
+# ============================================================================
 logging:
   level: "INFO"

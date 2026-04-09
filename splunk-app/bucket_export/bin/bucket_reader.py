@@ -234,24 +234,37 @@ def _parse_bucket_dir(
     return None
 
 # ---------------------------------------------------------------------------
-# Journal.gz reader
+# Journal reader (journal.gz / journal.zst)
 # ---------------------------------------------------------------------------
 
-# Splunk journal.gz record header format (observed via hex analysis):
-# The journal is a gzip stream of concatenated records.
-# Each record has a variable-length header followed by raw event text.
+# Splunk journal format (reverse-engineered from Splunk 9.1):
 #
-# Record structure (approximate — varies by Splunk version):
-#   [4 bytes] record_len (big-endian uint32, total record size)
-#   [8 bytes] _time (big-endian int64, epoch seconds * 1000 or epoch float)
-#   [variable] metadata fields (null-separated key=value pairs)
-#   [variable] _raw event text (remainder of record)
+# The journal is a compressed stream (gzip or zstandard) containing
+# "slices" — groups of events sharing common metadata.
 #
-# Metadata fields include: source, sourcetype, host, _cd, _indextime, etc.
-# The exact layout depends on Splunk version — we use heuristics to detect.
+# Structure:
+#   [global header]
+#     - host::hostname
+#     - First source/sourcetype section
+#   [slice N]
+#     - source::/path/to/source
+#     - sourcetype::type_name
+#     - [event text blocks separated by binary framing]
+#
+# Each slice contains events from a single source/sourcetype combination.
+# Events are raw text blocks (the _raw field) interleaved with binary
+# metadata bytes (timestamps, field positions, etc.).
+#
+# The binary framing between events contains protobuf-encoded metadata
+# but the raw event text is stored as plain UTF-8.
 
-# Known journal magic bytes / record delimiters
-JOURNAL_RECORD_MAGIC = b"\x00\x00"  # Common prefix in record headers
+# Optional zstandard support
+_zstd_available = False
+try:
+    import zstandard
+    _zstd_available = True
+except ImportError:
+    pass
 
 
 def read_bucket_events(
@@ -281,7 +294,7 @@ def read_bucket_events(
 
     count = 0
     try:
-        yield from _read_journal_gz(
+        yield from _read_journal(
             journal_path, bucket, max_events,
             source_filter, sourcetype_filter
         )
@@ -289,7 +302,7 @@ def read_bucket_events(
         log.error(f"Error reading bucket {bucket.bucket_id}: {e}")
         raise
 
-def _read_journal_gz(
+def _read_journal(
     journal_path: Path,
     bucket: BucketInfo,
     max_events: int = 0,
@@ -297,208 +310,241 @@ def _read_journal_gz(
     sourcetype_filter: Optional[str] = None,
 ) -> Generator[SplunkEvent, None, None]:
     """
-    Parse a Splunk journal.gz file and yield individual events.
+    Parse a Splunk journal file (journal.gz or journal.zst).
 
-    Journal.gz is a gzip-compressed stream of concatenated records.
-    Each record contains a header with metadata followed by the raw event.
+    Splunk 9.x uses zstandard (.zst), older versions use gzip (.gz).
+    The decompressed content contains "slices" — groups of events sharing
+    common metadata (host, source, sourcetype). Each slice has:
+      - source::/path and sourcetype::name markers
+      - Event text blocks (the _raw field) interleaved with binary framing
 
-    The format varies by Splunk version. We support two known layouts:
-      Layout A (Splunk 7.x+):
-        [4 bytes] record_length (big-endian uint32)
-        [8 bytes] _time (big-endian double, epoch float)
-        [variable] null-separated key=value metadata
-        [variable] _raw text (after final null separator)
-
-      Layout B (Splunk 6.x / older):
-        [4 bytes] record_length (big-endian uint32)
-        [4 bytes] _time (big-endian uint32, epoch seconds)
-        [variable] metadata + _raw
-
-    We auto-detect the layout by examining timestamp plausibility.
+    We extract metadata from markers and raw text from readable byte runs.
     """
     count = 0
+    # --- Decompress ---
+    suffix = str(journal_path).lower()
     try:
-        with gzip.open(str(journal_path), "rb") as gz:
-            data = gz.read()
+        if suffix.endswith(".zst"):
+            if not _zstd_available:
+                log.error("journal.zst found but zstandard not installed. "
+                          "pip install zstandard")
+                return
+            with open(journal_path, "rb") as f:
+                compressed = f.read()
+            dctx = zstandard.ZstdDecompressor()
+            data = dctx.decompress(compressed, max_output_size=500 * 1024 * 1024)
+        else:
+            with gzip.open(str(journal_path), "rb") as gz:
+                data = gz.read()
     except Exception as e:
         log.error(f"Failed to decompress {journal_path}: {e}")
         return
 
-    if len(data) < 12:
+    if len(data) < 20:
         log.warning(f"Journal too small ({len(data)} bytes): {journal_path}")
         return
 
-    log.debug(f"Decompressed journal: {len(data)} bytes")
+    log.debug(f"Decompressed journal: {len(data):,} bytes from {journal_path.name}")
 
-    # Try to parse as concatenated records
-    offset = 0
-    errors = 0
-    max_errors = 50  # bail if too many consecutive parse failures
+    # --- Extract global host ---
+    global_host = ""
+    hm = re.search(rb'host::([^\x00-\x05]+)', data)
+    if hm:
+        global_host = hm.group(1).decode("utf-8", errors="replace")
 
-    while offset < len(data) - 4:
+    # --- Find metadata sections (source/sourcetype boundaries) ---
+    sections = _find_journal_sections(data)
+    if not sections:
+        # Fallback: treat entire journal as one section
+        sections = [{"source": "", "sourcetype": "", "start": 0, "end": len(data)}]
+
+    # --- Extract events from each section ---
+    for sec in sections:
         if max_events and count >= max_events:
             break
-        if errors > max_errors:
-            log.error(f"Too many parse errors ({errors}), stopping at offset {offset}")
-            break
 
-        # Read record length
-        rec_len = struct.unpack(">I", data[offset:offset + 4])[0]
+        source = sec["source"]
+        sourcetype = sec["sourcetype"]
+        host = global_host
 
-        # Sanity check record length
-        if rec_len < 12 or rec_len > 10_000_000:
-            # Try scanning forward for next valid record
-            offset += 1
-            errors += 1
+        # Apply metadata filters early
+        if source_filter and source_filter not in source:
+            continue
+        if sourcetype_filter and sourcetype_filter not in sourcetype:
             continue
 
-        if offset + 4 + rec_len > len(data):
-            # Truncated record at end of file
-            log.debug(f"Truncated record at offset {offset}, "
-                      f"rec_len={rec_len}, remaining={len(data) - offset}")
-            break
+        chunk = data[sec["start"]:sec["end"]]
 
-        record = data[offset + 4: offset + 4 + rec_len]
-        offset += 4 + rec_len
-        errors = 0  # reset on successful frame
+        for raw_text in _extract_text_blocks(chunk):
+            if max_events and count >= max_events:
+                break
 
-        # Parse record into event
-        event = _parse_journal_record(record, bucket)
-        if event is None:
-            continue
+            # Try to extract timestamp from the event text
+            ts = _extract_timestamp_from_raw(raw_text)
 
-        # Apply filters
-        if source_filter and source_filter not in event.source:
-            continue
-        if sourcetype_filter and sourcetype_filter not in event.sourcetype:
-            continue
-
-        count += 1
-        yield event
+            event = SplunkEvent(
+                _time=ts,
+                _raw=raw_text,
+                host=host,
+                source=source,
+                sourcetype=sourcetype,
+                index=bucket.index_name,
+                bucket_id=bucket.bucket_id,
+                bucket_type=bucket.bucket_type,
+            )
+            count += 1
+            yield event
 
     log.info(f"Extracted {count} events from {journal_path.name} "
-             f"(errors={errors}, final_offset={offset}/{len(data)})")
+             f"({len(sections)} sections, {len(data):,} bytes decompressed)")
 
 
-# Epoch range for sanity-checking timestamps (2000-01-01 to 2040-01-01)
-_EPOCH_MIN = 946684800
-_EPOCH_MAX = 2208988800
+# Metadata field names that are NOT event text
+_METADATA_PREFIXES = (
+    "source::", "sourcetype::", "host::", "event",
+    "timestartpos", "timeendpos", "date_second", "date_hour",
+    "date_minute", "date_year", "date_month", "date_mday",
+    "date_wday", "date_zone",
+)
+
+# Day/month names that appear as metadata values
+_METADATA_VALUES = {
+    "local", "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+}
 
 
-def _parse_journal_record(
-    record: bytes,
-    bucket: BucketInfo,
-) -> Optional[SplunkEvent]:
+def _find_journal_sections(data: bytes) -> List[dict]:
     """
-    Parse a single journal record into a SplunkEvent.
+    Find metadata sections in a Splunk journal.
 
-    Attempts two timestamp layouts:
-      1. 8-byte double (Splunk 7.x+)
-      2. 4-byte uint32 (Splunk 6.x)
+    Each section starts with a source:: marker followed by a sourcetype:: marker.
+    Returns list of {source, sourcetype, start, end} dicts.
     """
-    if len(record) < 12:
-        return None
+    sections = []
+    # Match source:: with optional prefix chars (#, $, @) — Splunk uses
+    # $source::, #source::, @source:: as alternate section markers
+    for m in re.finditer(rb'[$#@]?source::([^\x00-\x05]+)', data):
+        source_val = m.group(1).decode("utf-8", errors="replace")
+        # Clean: source value may run directly into "sourcetype::"
+        if "sourcetype::" in source_val:
+            source_val = source_val[:source_val.index("sourcetype::")]
 
-    # --- Layout A: 8-byte double timestamp ---
-    try:
-        ts_double = struct.unpack(">d", record[0:8])[0]
-        if _EPOCH_MIN <= ts_double <= _EPOCH_MAX:
-            return _extract_event(record[8:], ts_double, bucket)
-    except struct.error:
-        pass
+        # Find sourcetype:: after this source (may be immediately adjacent
+        # or within a few hundred bytes)
+        search_start = m.start()
+        st_match = re.search(rb'sourcetype::([^\x00-\x06]+)',
+                             data[search_start:search_start + 500])
+        sourcetype_val = ""
+        if st_match:
+            sourcetype_val = st_match.group(1).decode("utf-8", errors="replace")
+            # Clean trailing metadata field names
+            for sep in ("timestartpos", "timeendpos", "date_"):
+                idx = sourcetype_val.find(sep)
+                if idx >= 0:
+                    sourcetype_val = sourcetype_val[:idx]
+            sourcetype_val = sourcetype_val.strip("\x00\x06\x0a\r\n ")
 
-    # --- Layout B: 4-byte uint32 timestamp ---
-    try:
-        ts_int = struct.unpack(">I", record[0:4])[0]
-        if _EPOCH_MIN <= ts_int <= _EPOCH_MAX:
-            return _extract_event(record[4:], float(ts_int), bucket)
-    except struct.error:
-        pass
+        sections.append({
+            "source": source_val,
+            "sourcetype": sourcetype_val,
+            "start": m.start(),
+        })
 
-    # --- Layout C: skip 4-byte flags then 8-byte double ---
-    try:
-        ts_double = struct.unpack(">d", record[4:12])[0]
-        if _EPOCH_MIN <= ts_double <= _EPOCH_MAX:
-            return _extract_event(record[12:], ts_double, bucket)
-    except struct.error:
-        pass
-
-    log.debug(f"Could not parse timestamp from record ({len(record)} bytes)")
-    return None
-
-
-def _extract_event(
-    payload: bytes,
-    timestamp: float,
-    bucket: BucketInfo,
-) -> Optional[SplunkEvent]:
-    """
-    Extract metadata and _raw from the post-timestamp payload.
-
-    Payload structure: null-separated key=value pairs, followed by
-    the raw event text after the last metadata field.
-    """
-    host = ""
-    source = ""
-    sourcetype = ""
-    raw_text = ""
-
-    # Split on null bytes to find metadata fields
-    parts = payload.split(b"\x00")
-
-    # Find where metadata ends and _raw begins
-    # Metadata fields contain '=' signs; _raw typically does not start with one
-    meta_end = 0
-    for i, part in enumerate(parts):
-        if not part:
-            continue
-        try:
-            decoded = part.decode("utf-8", errors="replace")
-        except Exception:
-            decoded = part.decode("latin-1", errors="replace")
-
-        if "=" in decoded and len(decoded) < 4096:
-            # Looks like a metadata field
-            key, _, val = decoded.partition("=")
-            key = key.strip().lower()
-            if key == "host":
-                host = val
-            elif key == "source":
-                source = val
-            elif key == "sourcetype":
-                sourcetype = val
-            meta_end = i + 1
+    # Set end boundaries
+    for i in range(len(sections)):
+        if i + 1 < len(sections):
+            sections[i]["end"] = sections[i + 1]["start"]
         else:
-            # This part doesn't look like metadata — it's _raw or start of _raw
-            break
+            sections[i]["end"] = len(data)
 
-    # Everything from meta_end onward is the raw event
-    raw_parts = parts[meta_end:]
-    if raw_parts:
+    return sections
+
+
+def _extract_text_blocks(chunk: bytes, min_len: int = 15) -> Generator[str, None, None]:
+    """
+    Extract readable text blocks from a journal chunk.
+
+    Events are stored as plain UTF-8 text interleaved with binary framing.
+    We find contiguous runs of printable ASCII (+ common whitespace) and
+    yield those that look like actual log events (not metadata).
+    """
+    i = 0
+    length = len(chunk)
+    while i < length:
+        b = chunk[i]
+        if b >= 0x20 and b < 0x7f:
+            # Start of a printable text run
+            k = i
+            while k < length and (chunk[k] >= 0x20 or chunk[k] in (0x0a, 0x0d, 0x09)):
+                k += 1
+            text = chunk[i:k].decode("utf-8", errors="replace").strip()
+
+            if len(text) >= min_len:
+                text_lower = text.lower()
+                # Skip metadata fields
+                if not any(text_lower.startswith(p) for p in _METADATA_PREFIXES):
+                    # Skip standalone metadata values (day/month names)
+                    if text_lower not in _METADATA_VALUES:
+                        # Skip source path refs with prefix markers
+                        if not (len(text) > 1 and text[0] in ('#', '$', '@')
+                                and "source::" in text):
+                            yield text
+            i = k
+        else:
+            i += 1
+
+
+# Common timestamp patterns for parsing _time from raw event text
+_TS_PATTERNS = [
+    # ISO-ish: 2026-04-07 23:20:22-05
+    re.compile(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})'),
+    # Splunk internal: 04-07-2026 23:26:38.884 -0500
+    re.compile(r'(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2}:\d{2})'),
+    # Syslog: Apr  7 23:19:15
+    re.compile(r'([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})'),
+]
+
+
+def _extract_timestamp_from_raw(raw: str) -> float:
+    """
+    Best-effort timestamp extraction from raw event text.
+    Returns epoch float, or current time as fallback.
+    """
+    # Pattern 1: YYYY-MM-DD HH:MM:SS
+    m = _TS_PATTERNS[0].search(raw[:60])
+    if m:
         try:
-            raw_text = b"\x00".join(raw_parts).decode("utf-8", errors="replace").strip()
-        except Exception:
-            raw_text = b"\x00".join(raw_parts).decode("latin-1", errors="replace").strip()
-    else:
-        # Fallback: try entire payload as raw text
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}",
+                                   "%Y-%m-%d %H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+
+    # Pattern 2: MM-DD-YYYY HH:MM:SS
+    m = _TS_PATTERNS[1].search(raw[:60])
+    if m:
         try:
-            raw_text = payload.decode("utf-8", errors="replace").strip()
-        except Exception:
-            raw_text = payload.decode("latin-1", errors="replace").strip()
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}",
+                                   "%m-%d-%Y %H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
 
-    if not raw_text:
-        return None
+    # Pattern 3: Syslog (Mon DD HH:MM:SS — assume current year)
+    m = _TS_PATTERNS[2].search(raw[:30])
+    if m:
+        try:
+            year = datetime.now().year
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)} {year}",
+                                   "%b %d %H:%M:%S %Y")
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
 
-    return SplunkEvent(
-        _time=timestamp,
-        _raw=raw_text,
-        host=host,
-        source=source,
-        sourcetype=sourcetype,
-        index=bucket.index_name,
-        bucket_id=bucket.bucket_id,
-        bucket_type=bucket.bucket_type,
-    )
+    return time.time()
 
 
 # ---------------------------------------------------------------------------

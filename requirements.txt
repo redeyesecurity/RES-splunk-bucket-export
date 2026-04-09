@@ -1,8 +1,28 @@
 # Core (required)
 pyyaml>=6.0
 
-# Parquet export (optional but recommended)
+# --- Destination-specific (install what you need) ---
+
+# Parquet export (local + S3)
 pyarrow>=12.0
 
-# S3 export (optional)
+# S3 / MinIO / R2
 boto3>=1.28
+
+# Kafka / Confluent / Redpanda
+confluent-kafka>=2.1
+
+# Loki / Webhook / Splunk HEC
+requests>=2.28
+
+# Elasticsearch / OpenSearch
+elasticsearch>=8.0
+
+# Azure Event Hubs
+azure-eventhub>=5.11
+
+# GCP Pub/Sub
+google-cloud-pubsub>=2.18
+
+# Syslog — no extra deps (stdlib socket/ssl)
+# Local JSON — no extra deps (stdlib json)
