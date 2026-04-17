@@ -1,0 +1,35 @@
+graph LR
+    subgraph Splunk["Splunk Indexer"]
+        Buckets["Buckets<br/>(hot/warm/cold/frozen)<br/>journal.gz"]
+    end
+
+    subgraph Pipeline["Export Pipeline"]
+        BR["bucket_reader.py<br/>Discover & decompress"]
+        OCSF["ocsf_mapper.py<br/>OCSF v1.1 transform<br/>(optional)"]
+        EW["export_writer.py<br/>Hive-partitioned output"]
+        EX["exporter.py<br/>Orchestrator"]
+        State["export_state.json<br/>Dedup tracking"]
+    end
+
+    subgraph Destinations
+        Parquet["Local Parquet<br/>(Snappy/Gzip/Zstd)"]
+        S3["S3-compatible<br/>(AWS / MinIO / R2)"]
+        JSON["Local NDJSON"]
+    end
+
+    Buckets --> BR
+    BR --> OCSF
+    OCSF --> EW
+    EW --> Parquet
+    EW --> S3
+    EW --> JSON
+    EX -.->|orchestrates| BR
+    EX -.->|reads/writes| State
+
+    classDef splunk fill:#65a637,color:#fff,stroke:#4a7a28
+    classDef pipe fill:#2563eb,color:#fff,stroke:#1d4ed8
+    classDef dest fill:#059669,color:#fff,stroke:#047857
+
+    class Buckets splunk
+    class BR,OCSF,EW,EX,State pipe
+    class Parquet,S3,JSON dest
